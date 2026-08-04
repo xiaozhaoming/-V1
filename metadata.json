@@ -1,0 +1,6 @@
+{
+  "name": "离线视频语音转文案提取器",
+  "description": "零Token消耗、强隐私保护的本地音视频语音转文字文案提取工具，支持本地文件上传、URL解析、实时转录、编辑与多格式导出。",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
