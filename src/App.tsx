@@ -31,15 +31,38 @@ export default function App() {
     mediaType: 'video',
   });
 
-  const [options, setOptions] = useState<TranscriptionOptions>({
-    engine: 'gemini',
-    modelSize: 'base',
-    language: 'zh',
-    autoPunctuation: true,
-    filterFillers: true,
-    includeTimestamps: true,
-    segmentDuration: 5,
+  const [options, setOptions] = useState<TranscriptionOptions>(() => {
+    const defaultOpts: TranscriptionOptions = {
+      engine: 'gemini',
+      modelSize: 'base',
+      language: 'zh',
+      autoPunctuation: true,
+      filterFillers: true,
+      includeTimestamps: true,
+      segmentDuration: 5,
+      domainPreset: 'battery',
+      customHotwords: '',
+      enableDomainCorrection: true,
+    };
+    try {
+      const saved = localStorage.getItem('transcriber_options_v1');
+      if (saved) {
+        return { ...defaultOpts, ...JSON.parse(saved) };
+      }
+    } catch (err) {
+      console.warn('Failed to load saved options:', err);
+    }
+    return defaultOpts;
   });
+
+  // Save options state (including custom hotwords & domain presets) to localStorage on change
+  useEffect(() => {
+    try {
+      localStorage.setItem('transcriber_options_v1', JSON.stringify(options));
+    } catch (err) {
+      console.warn('Failed to save options to localStorage:', err);
+    }
+  }, [options]);
 
   const [progressState, setProgressState] = useState<ProgressState>({
     status: 'idle',
@@ -130,8 +153,16 @@ export default function App() {
         if (!resp.ok) {
           let errDetail = '无法拉取该视频流，可能链接已失效或受防盗链保护，请尝试直接上传本地文件';
           try {
-            const errJson = await resp.json();
-            if (errJson.error) errDetail = errJson.error;
+            const rawTxt = await resp.text();
+            try {
+              const errJson = JSON.parse(rawTxt);
+              if (errJson.error) errDetail = errJson.error;
+              else if (errJson.message) errDetail = errJson.message;
+            } catch {
+              if (rawTxt && rawTxt.length < 250 && !rawTxt.startsWith('<')) {
+                errDetail = rawTxt;
+              }
+            }
           } catch {}
           throw new Error(errDetail);
         }
@@ -208,7 +239,7 @@ export default function App() {
             <div>
               <div className="flex items-center gap-2 text-indigo-600 text-xs font-bold uppercase tracking-wider">
                 <Sparkles className="w-4 h-4" />
-                <span>三引擎全能听写 3.0</span>
+                <span>三引擎全能听写 v1.3 (高保真并发版)</span>
               </div>
               <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900 mt-1 tracking-tight">
                 短视频语音转文案提取器
@@ -280,7 +311,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-200 py-6 text-center text-xs text-slate-500 space-y-1 bg-white">
-        <p>离线视频语音转文案提取器 1.0 • 零 Token 消耗 • 隐私安全</p>
+        <p>离线视频语音转文案提取器 v1.3 • 零 Token 消耗 • 无损 10x 极速并发识别</p>
         <p className="text-[11px] text-slate-400">Faster-Whisper Engine | Client-Side AudioContext Decoding</p>
       </footer>
 

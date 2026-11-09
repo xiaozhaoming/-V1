@@ -11,9 +11,13 @@ import {
   Volume2, 
   Info,
   Layers,
-  Globe
+  Globe,
+  BookOpen,
+  Wand2,
+  Tag
 } from 'lucide-react';
-import { MediaInputState, SourceType, TranscriptionOptions, EngineType, ModelSize, LanguageCode } from '../types';
+import { MediaInputState, SourceType, TranscriptionOptions, EngineType, ModelSize, LanguageCode, DomainPreset } from '../types';
+import { DOMAIN_PRESETS, getEffectiveHotwords } from '../constants/domains';
 
 interface InputSectionProps {
   inputState: MediaInputState;
@@ -384,6 +388,111 @@ export const InputSection: React.FC<InputSectionProps> = ({
             </a>
           </div>
         )}
+      </div>
+
+      {/* Domain Hotwords & Precision Correction Card */}
+      <div className="bg-gradient-to-br from-indigo-50/80 via-slate-50 to-purple-50/40 rounded-xl p-4 border border-indigo-100 shadow-sm space-y-3.5">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 border-b border-indigo-100/80 pb-2.5">
+          <div className="flex items-center gap-2">
+            <div className="p-1.5 bg-indigo-600 text-white rounded-lg shadow-sm">
+              <BookOpen className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                <span>🎯 行业专有名词与热词词库 (专治同音错别字)</span>
+                <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 text-[10px] font-extrabold">
+                  双阶段精准校准
+                </span>
+              </h3>
+              <p className="text-[11px] text-slate-500 mt-0.5">
+                先向 ASR 引擎注入热词提示，再由 Gemini 3.6 Flash 对同音错听（如"磷酸铁铝"→"磷酸铁锂"）进行二次对齐修正
+              </p>
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 px-2.5 py-1.5 bg-white border border-indigo-200 rounded-lg shadow-2xs cursor-pointer select-none text-xs text-indigo-900 font-semibold hover:border-indigo-300 transition-colors">
+            <input
+              type="checkbox"
+              checked={options.enableDomainCorrection}
+              onChange={(e) => setOptions(prev => ({ ...prev, enableDomainCorrection: e.target.checked }))}
+              className="w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+            />
+            <span className="flex items-center gap-1">
+              <Wand2 className="w-3.5 h-3.5 text-indigo-600" />
+              <span>开启二次 AI 同音精准校正</span>
+            </span>
+          </label>
+        </div>
+
+        {/* Domain Presets Selector */}
+        <div className="space-y-1.5">
+          <label className="text-[11px] font-semibold text-slate-700 flex items-center justify-between">
+            <span>预设领域热词集:</span>
+            <span className="text-[10px] text-indigo-600 font-medium">
+              当前: {DOMAIN_PRESETS[options.domainPreset || 'battery']?.name}
+            </span>
+          </label>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
+            {Object.values(DOMAIN_PRESETS).map((preset) => {
+              const isSelected = (options.domainPreset || 'battery') === preset.id;
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => setOptions(prev => ({ ...prev, domainPreset: preset.id as DomainPreset }))}
+                  className={`flex flex-col items-center justify-center p-2 rounded-lg text-xs font-medium border transition-all text-center gap-1 ${
+                    isSelected 
+                      ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm ring-2 ring-indigo-200 font-bold' 
+                      : 'bg-white text-slate-700 border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/50'
+                  }`}
+                >
+                  <span className="text-base">{preset.icon}</span>
+                  <span className="text-[11px] truncate max-w-full">{preset.name.split(' ')[0]}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Custom Hotwords Input & Live Tag Preview */}
+        <div className="space-y-2 pt-1">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="font-semibold text-slate-700 flex items-center gap-1">
+              <Tag className="w-3.5 h-3.5 text-indigo-500" />
+              <span>补充自定义专有名词 (多个词请用逗号或换行分隔):</span>
+            </span>
+          </div>
+
+          <textarea
+            rows={2}
+            placeholder="例如：磷酸铁锂, 固态电池, NCM811, 针刺测试, 热失控, 库仑效率, SOC, 硅碳负极..."
+            value={options.customHotwords || ''}
+            onChange={(e) => setOptions(prev => ({ ...prev, customHotwords: e.target.value }))}
+            className="w-full bg-white border border-slate-200 focus:border-indigo-500 rounded-lg p-2.5 text-xs text-slate-800 outline-none shadow-inner leading-relaxed resize-y font-mono"
+          />
+
+          {/* Active Hotwords Preview Tags */}
+          <div className="bg-white/80 border border-slate-200/80 rounded-lg p-2.5 space-y-1.5">
+            <div className="text-[10px] font-bold text-slate-500 flex items-center justify-between">
+              <span>当前已启用的专有名词词库 ({getEffectiveHotwords(options.domainPreset || 'battery', options.customHotwords).split(/[,，]+/).filter(Boolean).length} 个):</span>
+              <span className="text-[10px] text-slate-400">将优先引导 ASR 识别与二次同音修正</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto pt-0.5">
+              {getEffectiveHotwords(options.domainPreset || 'battery', options.customHotwords)
+                .split(/[,，\n]+/)
+                .map((term) => term.trim())
+                .filter(Boolean)
+                .map((term, idx) => (
+                  <span 
+                    key={idx} 
+                    className="px-2 py-0.5 rounded bg-indigo-50 border border-indigo-100 text-indigo-700 text-[11px] font-medium inline-flex items-center gap-0.5"
+                  >
+                    #{term}
+                  </span>
+                ))}
+            </div>
+          </div>
+        </div>
       </div>
 
     </div>

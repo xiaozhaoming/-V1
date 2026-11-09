@@ -111,13 +111,12 @@ export async function decodeAudioData(
     onProgress?.(50);
 
     // Promise and callback hybrid for maximum cross-browser support
-    const bufferCopy = arrayBuffer.slice(0);
     let decodedBuffer: AudioBuffer | null = null;
 
     try {
       decodedBuffer = await new Promise<AudioBuffer>((resolve, reject) => {
         const res = audioContext.decodeAudioData(
-          bufferCopy,
+          arrayBuffer,
           (buf) => resolve(buf),
           (err) => reject(err)
         );
@@ -151,7 +150,33 @@ export async function decodeAudioData(
 
 /**
  * Resample AudioBuffer to 16,000 Hz single channel Float32Array (standard PCM format for speech models)
+ * Uses high-quality browser OfflineAudioContext anti-aliased resampling when available.
  */
+export async function resampleTo16kHzMonoAsync(audioBuffer: AudioBuffer): Promise<Float32Array> {
+  const targetSampleRate = 16000;
+  
+  try {
+    const OfflineCtxClass = window.OfflineAudioContext || (window as any).webkitOfflineAudioContext;
+    if (OfflineCtxClass) {
+      const offlineCtx = new OfflineCtxClass(
+        1,
+        Math.ceil(audioBuffer.duration * targetSampleRate),
+        targetSampleRate
+      );
+      const source = offlineCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(offlineCtx.destination);
+      source.start(0);
+      const renderedBuffer = await offlineCtx.startRendering();
+      return renderedBuffer.getChannelData(0);
+    }
+  } catch (err) {
+    console.warn("[OfflineAudioContext] High-quality resampling fallback:", err);
+  }
+
+  return resampleTo16kHzMono(audioBuffer);
+}
+
 export function resampleTo16kHzMono(audioBuffer: AudioBuffer): Float32Array {
   const targetSampleRate = 16000;
   const numChannels = audioBuffer.numberOfChannels;
@@ -283,3 +308,53 @@ export function chunkAudioByVAD(
 
   return chunks;
 }
+
+/**
+ * Encode 16kHz mono Float32Array PCM data into a standard PCM 16-bit WAV Blob
+ */
+export function encodeWavBlob(pcmData: Float32Array, sampleRate: number = 16000): Blob {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const dataSize = pcmData.length * (bitsPerSample / 8);
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  // Helper to write ASCII strings
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  // RIFF header
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+
+  // fmt sub-chunk
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);          // SubChunk1Size (16 for PCM)
+  view.setUint16(20, 1, true);           // AudioFormat (1 = PCM)
+  view.setUint16(22, numChannels, true); // Mono = 1
+  view.setUint32(24, sampleRate, true);  // 16000 Hz
+  view.setUint32(28, byteRate, true);    // ByteRate
+  view.setUint16(32, blockAlign, true);  // BlockAlign
+  view.setUint16(34, bitsPerSample, true);// 16 bits
+
+  // data sub-chunk
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  // Write Float32 samples converted to 16-bit Int PCM
+  let offset = 44;
+  for (let i = 0; i < pcmData.length; i++, offset += 2) {
+    const sample = Math.max(-1, Math.min(1, pcmData[i]));
+    const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+    view.setInt16(offset, int16, true);
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+

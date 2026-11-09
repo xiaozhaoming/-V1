@@ -7,17 +7,18 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: "50mb" }));
+  app.use(express.json({ limit: "200mb" }));
+  app.use(express.urlencoded({ limit: "200mb", extended: true }));
 
   // API Routes
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", app: "离线视频语音转文案提取器 1.0", version: "1.0.0" });
+    res.json({ status: "ok", app: "离线视频语音转文案提取器 1.3", version: "1.3.0" });
   });
 
   // High-precision Speech-to-Text Transcription Endpoint
   app.post("/api/transcribe", async (req, res) => {
     try {
-      const { audioBase64, mimeType, language = "zh" } = req.body;
+      const { audioBase64, mimeType, language = "zh", hotwords } = req.body;
       if (!audioBase64 || typeof audioBase64 !== "string") {
         return res.status(400).json({ error: "Missing audioBase64 data" });
       }
@@ -48,13 +49,17 @@ async function startServer() {
       };
       const langName = langMap[language] || "中文";
 
-      let cleanMimeType = (mimeType || "audio/mp3").split(";")[0].trim().toLowerCase();
+      let cleanMimeType = (mimeType || "audio/wav").split(";")[0].trim().toLowerCase();
       if (!cleanMimeType || cleanMimeType === "application/octet-stream") {
-        cleanMimeType = "audio/mp3";
+        cleanMimeType = "audio/wav";
       }
 
+      const hotwordsHint = hotwords && typeof hotwords === "string" && hotwords.trim()
+        ? `\n【专业领域热词/词汇表】：\n${hotwords.trim()}\n注意：语音听写时若听到同音或谐音词，请优先精确匹配并替换为上述专业词汇。`
+        : "";
+
       const prompt = `你是一个专业的音视频语音转文字提取助手。请仔细听此音视频媒体，将其完整准确地转写为逐句文本文案。
-目标语言：${langName}。
+目标语言：${langName}。${hotwordsHint}
 请以 JSON 格式输出，格式必须为：
 {
   "segments": [
@@ -66,21 +71,58 @@ async function startServer() {
 1. 精准听写还原人物说话的具体字句文案，按完整标点或停顿拆分成不同句子段落。
 2. 时间戳 start 和 end 为以秒为单位的浮点数字。`;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: [
-          {
-            inlineData: {
-              mimeType: cleanMimeType,
-              data: audioBase64.replace(/^data:[^;]+;base64,/, "")
+      let response: any = null;
+      let lastErr: any = null;
+      const candidateModels = [
+        "gemini-3.6-flash",
+        "gemini-2.5-flash"
+      ];
+      
+      const rawData = audioBase64.replace(/^data:[^;]+;base64,/, "");
+
+      for (const mName of candidateModels) {
+        // Retry loop up to 2 times for transient 429 rate limit
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            response = await ai.models.generateContent({
+              model: mName,
+              contents: [
+                {
+                  inlineData: {
+                    mimeType: cleanMimeType,
+                    data: rawData
+                  }
+                },
+                { text: prompt }
+              ],
+              config: {
+                responseMimeType: "application/json"
+              }
+            });
+            if (response && response.text) break;
+          } catch (e: any) {
+            lastErr = e;
+            const errMsg = e?.message || String(e);
+            console.warn(`[Transcribe API] Model ${mName} (attempt ${attempt + 1}) failed:`, errMsg);
+
+            if (errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED") || errMsg.includes("quota")) {
+              // Wait 3s before retry or fallback
+              await new Promise((r) => setTimeout(r, 3000));
+            } else {
+              break; // non-rate-limit error, try next model immediately
             }
-          },
-          { text: prompt }
-        ],
-        config: {
-          responseMimeType: "application/json"
+          }
         }
-      });
+        if (response && response.text) break;
+      }
+
+      if (!response || !response.text) {
+        const msg = lastErr?.message || "Gemini 语音识别云端调用无响应";
+        if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
+          throw new Error("Gemini API 免费配额已触发频率限制 (429)。建议在左侧引擎切为【Groq Cloud (Whisper-large-v3)】或【Faster-Whisper 本地离线】秒级完成转写。");
+        }
+        throw new Error(msg);
+      }
 
       const responseText = (response.text || "").trim();
       let parsed: any = null;
@@ -178,7 +220,7 @@ async function startServer() {
   // Groq Cloud Whisper-large-v3 Speech-to-Text Endpoint
   app.post("/api/transcribe-groq", async (req, res) => {
     try {
-      const { audioBase64, mimeType, language = "zh", userGroqApiKey } = req.body;
+      const { audioBase64, mimeType, language = "zh", userGroqApiKey, hotwords } = req.body;
       if (!audioBase64 || typeof audioBase64 !== "string") {
         return res.status(400).json({ error: "Missing audioBase64 data" });
       }
@@ -214,6 +256,11 @@ async function startServer() {
       if (language && language !== "auto") {
         const langCode = language === "yue" ? "zh" : language;
         formData.append("language", langCode);
+      }
+
+      if (hotwords && typeof hotwords === "string" && hotwords.trim()) {
+        const safePrompt = hotwords.trim().slice(0, 800);
+        formData.append("prompt", safePrompt);
       }
 
       const groqRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
@@ -262,6 +309,88 @@ async function startServer() {
       return res.status(500).json({
         error: err.message || "Groq Cloud 语音服务连接异常"
       });
+    }
+  });
+
+  // LLM Domain Hotword Correction & Proofreading Endpoint
+  app.post("/api/correct-domain-terms", async (req, res) => {
+    const { segments = [], hotwords, domainName } = req.body || {};
+    try {
+      if (!Array.isArray(segments) || segments.length === 0) {
+        return res.json({ success: true, segments: [] });
+      }
+
+      if (!hotwords || typeof hotwords !== "string" || !hotwords.trim()) {
+        return res.json({ success: true, segments });
+      }
+
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.json({ success: true, segments });
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build'
+          }
+        }
+      });
+
+      const prompt = `你是一个【${domainName || '专业领域'}】文本校对专家。
+下面是一段语音识别 (ASR) 生成的逐句字幕。由于语音听写存在同音/谐音导致错听的专业名词错误（例如：将"磷酸铁锂"误识别为"磷酸铁铝"、将"热失控"误识别为"热失去"、将"枝晶"误识别为"支晶"、将"库仑效率"误识别为"枯伦效率"、将"NCM811"误识别为"NCM 811"）。
+
+【行业专业热词词库】：
+${hotwords.trim()}
+
+任务要求：
+1. 仔细对比字幕内容，【仅】将因发音谐音或拼写导致的专有名词错误修改为热词表中的标准正确词汇。
+2. 严禁改动说话人的口吻、标点符号或句子表达结构，严禁修改非错字的内容，严禁删减增添原句意思。
+3. 请严格以 JSON 数组格式返回校对后的字幕，结构必须保持与输入完全一致：
+[
+  { "id": "seg_1", "start": 0.0, "end": 4.2, "text": "校对后的准确句子..." }
+]`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.6-flash",
+        contents: [
+          { text: `${prompt}\n\n【待校对原始字幕JSON】：\n${JSON.stringify(segments)}` }
+        ],
+        config: {
+          responseMimeType: "application/json"
+        }
+      });
+
+      const responseText = (response.text || "").trim();
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(responseText);
+      } catch {
+        const cleanStr = responseText.replace(/```json/g, "").replace(/```/g, "").trim();
+        const match = cleanStr.match(/\[[\s\S]*\]/);
+        if (match) {
+          try { parsed = JSON.parse(match[0]); } catch {}
+        }
+      }
+
+      if (Array.isArray(parsed) && parsed.length === segments.length) {
+        const correctedSegments = segments.map((orig, i) => {
+          const item = parsed[i];
+          const newText = (item && typeof item.text === 'string' && item.text.trim()) ? item.text.trim() : orig.text;
+          return {
+            ...orig,
+            text: newText
+          };
+        });
+        return res.json({ success: true, segments: correctedSegments });
+      }
+
+      return res.json({ success: true, segments });
+    } catch (err: any) {
+      console.error("[Domain Correction Error]:", err);
+      // Fallback cleanly without blocking transcription
+      return res.json({ success: true, segments });
     }
   });
 
@@ -383,6 +512,23 @@ async function startServer() {
 
               if (douyinMatch) {
                 let foundUrl = douyinMatch[1] || douyinMatch[0];
+                foundUrl = foundUrl.replace(/\\u002F/g, "/").replace(/\\/g, "");
+                if (foundUrl.startsWith("http")) {
+                  directMediaUrl = foundUrl;
+                }
+              }
+            }
+
+            // 3. Bilibili (哔哩哔哩) video stream extraction
+            if (directMediaUrl === rawUrl && (hostname.includes("bilibili") || hostname.includes("b23.tv") || finalUrl.includes("bilibili"))) {
+              const biliMatch = 
+                htmlText.match(/"baseUrl":"(https?:\\\/\\\/[^\s"'\\]+)"/i) ||
+                htmlText.match(/"url":"(https?:\\\/\\\/[^\s"'\\]+)"/i) ||
+                htmlText.match(/https?:\\\/\\\/[^\s"'\\]+hdslb\.com\/[^\s"'\\]+/i) ||
+                htmlText.match(/https?:\/\/[^\s"'\\]+\.m4s/i);
+
+              if (biliMatch) {
+                let foundUrl = biliMatch[1] || biliMatch[0];
                 foundUrl = foundUrl.replace(/\\u002F/g, "/").replace(/\\/g, "");
                 if (foundUrl.startsWith("http")) {
                   directMediaUrl = foundUrl;

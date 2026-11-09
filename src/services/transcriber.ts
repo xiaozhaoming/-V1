@@ -2,9 +2,11 @@ import { pipeline, env } from '@xenova/transformers';
 import { 
   decodeAudioData, 
   resampleTo16kHzMono, 
+  resampleTo16kHzMonoAsync,
   chunkAudioByVAD, 
   formatTimestamp,
-  getMediaDuration
+  getMediaDuration,
+  encodeWavBlob
 } from './audioUtils';
 import { 
   TranscriptionOptions, 
@@ -12,6 +14,7 @@ import {
   TranscriptionSegment, 
   ProgressState 
 } from '../types';
+import { DOMAIN_PRESETS, getEffectiveHotwords } from '../constants/domains';
 
 // Configure transformers: disable local server path lookup and configure remote CDN & WASM paths
 env.allowLocalModels = false;
@@ -150,6 +153,209 @@ export function extractSummaryAndKeywords(text: string): { summaryPoints: string
 }
 
 /**
+ * Helper to convert Blob to Base64 string
+ */
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve((reader.result as string) || '');
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Cloud transcription with automatic 15-minute chunking and concurrency pool to maximize speed while keeping rate limits & memory safe
+ */
+async function transcribeCloudInChunks(
+  pcm16k: Float32Array | null,
+  fallbackBlob: Blob,
+  endpoint: '/api/transcribe' | '/api/transcribe-groq',
+  options: TranscriptionOptions,
+  effectiveHotwords: string,
+  onProgress: (pct: number, stageText: string) => void
+): Promise<{ segments: TranscriptionSegment[]; engineName: string }> {
+  // 15 minutes (900s) per chunk = ~28.8MB WAV = ~38MB Base64, reduces API request count by 33%
+  const CHUNK_SEC = 900; 
+  const sampleRate = 16000;
+  const chunkSamples = CHUNK_SEC * sampleRate;
+
+  let allSegments: TranscriptionSegment[] = [];
+  let engineName = endpoint === '/api/transcribe' ? 'Gemini 3.6 Flash' : 'Groq Cloud (Whisper-large-v3)';
+
+  if (pcm16k && pcm16k.length > 0) {
+    const totalSamples = pcm16k.length;
+    const totalChunks = Math.max(1, Math.ceil(totalSamples / chunkSamples));
+
+    // Prepare chunk tasks
+    const tasks = Array.from({ length: totalChunks }).map((_, c) => {
+      const startSample = c * chunkSamples;
+      const endSample = Math.min(totalSamples, (c + 1) * chunkSamples);
+      const subPcm = pcm16k.subarray(startSample, endSample);
+      const chunkWavBlob = encodeWavBlob(subPcm, sampleRate);
+      const chunkStartTimeSec = c * CHUNK_SEC;
+      return { index: c, blob: chunkWavBlob, startTime: chunkStartTimeSec };
+    });
+
+    let completedCount = 0;
+    const chunkResults: { index: number; segments: TranscriptionSegment[]; engine?: string }[] = [];
+
+    // Helper worker for a single chunk task with retry capability for rate limits
+    const processChunkWithRetry = async (task: { index: number; blob: Blob; startTime: number }) => {
+      const base64Audio = await blobToBase64(task.blob);
+      const payload: any = {
+        audioBase64: base64Audio,
+        mimeType: 'audio/wav',
+        language: options.language,
+        hotwords: effectiveHotwords
+      };
+      if (endpoint === '/api/transcribe-groq') {
+        payload.userGroqApiKey = options.groqApiKey;
+      }
+
+      let lastErrorDesc = '云端识别响应异常';
+      const maxRetries = 3;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          if (attempt > 0) {
+            onProgress(
+              Math.floor(40 + (completedCount / totalChunks) * 45),
+              `检测到 AI API 配额限制，正在等待重试第 ${task.index + 1}/${totalChunks} 段 (${attempt}/${maxRetries - 1})...`
+            );
+            await new Promise(r => setTimeout(r, attempt * 4000)); // 4s, 8s backoff
+          }
+
+          const resp = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+
+          if (!resp.ok) {
+            let errDesc = '云端识别响应异常';
+            try {
+              const errJson = await resp.json();
+              errDesc = errJson.message || errJson.error || errDesc;
+            } catch {
+              const text = await resp.text().catch(() => '');
+              if (text) errDesc = text.slice(0, 120);
+            }
+            lastErrorDesc = errDesc;
+            if (resp.status === 429 || errDesc.includes('429') || errDesc.includes('quota') || errDesc.includes('RESOURCE_EXHAUSTED')) {
+              continue; // retry
+            }
+            throw new Error(errDesc);
+          }
+
+          const data = await resp.json();
+          if (!data.success || !Array.isArray(data.segments)) {
+            throw new Error(data.error || '未能解析出有效听写文字');
+          }
+
+          const chunkSegs = data.segments.map((s: any, idx: number) => {
+            const segStart = typeof s.start === 'number' ? s.start + task.startTime : task.startTime + idx * 5;
+            const segEnd = typeof s.end === 'number' ? s.end + task.startTime : task.startTime + (idx + 1) * 5;
+            return {
+              id: `seg_${task.index}_${idx + 1}`,
+              start: Math.round(segStart * 100) / 100,
+              end: Math.round(segEnd * 100) / 100,
+              text: (s.text || '').trim()
+            };
+          }).filter((s: any) => s.text.length > 0);
+
+          completedCount++;
+          const progressPct = Math.floor(40 + (completedCount / totalChunks) * 45);
+          onProgress(
+            progressPct,
+            totalChunks === 1
+              ? 'AI 听写识别完成，正在整合文本...'
+              : `正在听写分段 (已完成 ${completedCount}/${totalChunks} 段)...`
+          );
+
+          return { index: task.index, segments: chunkSegs, engine: data.engine };
+        } catch (err: any) {
+          lastErrorDesc = err.message || String(err);
+          if (attempt === maxRetries - 1) throw new Error(lastErrorDesc);
+        }
+      }
+      throw new Error(lastErrorDesc);
+    };
+
+    // Parallel concurrency worker queue (Concurrency = 2)
+    const CONCURRENCY = 2;
+    let taskQueue = [...tasks];
+    
+    const worker = async () => {
+      while (taskQueue.length > 0) {
+        const task = taskQueue.shift();
+        if (!task) break;
+        const res = await processChunkWithRetry(task);
+        chunkResults.push(res);
+      }
+    };
+
+    const workers = Array.from({ length: Math.min(CONCURRENCY, tasks.length) }).map(() => worker());
+    await Promise.all(workers);
+
+    // Sort chunk results back in chronological order
+    chunkResults.sort((a, b) => a.index - b.index);
+    for (const res of chunkResults) {
+      allSegments.push(...res.segments);
+      if (res.engine) engineName = res.engine;
+    }
+  } else {
+    // Fallback if pcm16k is unavailable
+    const base64Audio = await blobToBase64(fallbackBlob);
+    onProgress(50, '正在云端极速识别中...');
+
+    const payload: any = {
+      audioBase64: base64Audio,
+      mimeType: fallbackBlob.type || 'audio/wav',
+      language: options.language,
+      hotwords: effectiveHotwords
+    };
+    if (endpoint === '/api/transcribe-groq') {
+      payload.userGroqApiKey = options.groqApiKey;
+    }
+
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!resp.ok) {
+      let errDesc = '云端识别响应异常';
+      try {
+        const errJson = await resp.json();
+        errDesc = errJson.message || errJson.error || errDesc;
+      } catch {
+        const text = await resp.text().catch(() => '');
+        if (text) errDesc = text.slice(0, 120);
+      }
+      throw new Error(errDesc);
+    }
+
+    const data = await resp.json();
+    if (!data.success || !Array.isArray(data.segments)) {
+      throw new Error(data.error || '未能解析出有效听写文字');
+    }
+
+    if (data.engine) engineName = data.engine;
+
+    allSegments = data.segments.map((s: any, idx: number) => ({
+      id: `seg_${idx + 1}`,
+      start: typeof s.start === 'number' ? Math.round(s.start * 100) / 100 : idx * 5,
+      end: typeof s.end === 'number' ? Math.round(s.end * 100) / 100 : (idx + 1) * 5,
+      text: (s.text || '').trim()
+    })).filter((s: any) => s.text.length > 0);
+  }
+
+  return { segments: allSegments, engineName };
+}
+
+/**
  * Core transcription process handler
  */
 export async function transcribeAudioSource(
@@ -171,7 +377,8 @@ export async function transcribeAudioSource(
   });
 
   let duration = 30;
-  let pcm16k = new Float32Array(16000 * 30);
+  let pcm16k: Float32Array | null = null;
+  let transmitBlob: Blob = audioBlob;
 
   try {
     const audioBuffer = await decodeAudioData(audioBlob, (pct) => {
@@ -184,7 +391,10 @@ export async function transcribeAudioSource(
     });
 
     duration = audioBuffer.duration || 30;
-    pcm16k = resampleTo16kHzMono(audioBuffer);
+    pcm16k = await resampleTo16kHzMonoAsync(audioBuffer);
+    if (pcm16k && pcm16k.length > 0) {
+      transmitBlob = encodeWavBlob(pcm16k, 16000);
+    }
   } catch (decodeErr: any) {
     console.warn("audioBuffer decode failed, proceeding with direct media blob:", decodeErr);
     // If decoding failed due to video container format or remote link, estimate duration
@@ -202,52 +412,29 @@ export async function transcribeAudioSource(
   let modelUsedName = `Faster-Whisper (${options.modelSize})`;
 
   const selectedEngine = options.engine || 'groq';
+  const effectiveHotwords = getEffectiveHotwords(options.domainPreset || 'battery', options.customHotwords);
+  const activeDomainInfo = DOMAIN_PRESETS[options.domainPreset || 'battery'];
 
   if (selectedEngine === 'groq') {
-    // Mode A: Groq Cloud Whisper-large-v3 LPU Engine (Super fast & accurate)
+    // Mode A: Groq Cloud Whisper-large-v3 LPU Engine
     try {
-      onProgress({
-        status: 'loading_model',
-        progress: 40,
-        stage: '正在调用 Groq Cloud (Whisper-large-v3) 芯片极速识别...',
-        details: '全球顶尖 LPU 算力秒级对齐转写'
-      });
-
-      const base64Audio = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result as string);
-        reader.onerror = reject;
-        reader.readAsDataURL(audioBlob);
-      });
-
-      const resp = await fetch('/api/transcribe-groq', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          audioBase64: base64Audio,
-          mimeType: audioBlob.type || 'video/mp4',
-          language: options.language,
-          userGroqApiKey: options.groqApiKey
-        })
-      });
-
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.success && Array.isArray(data.segments) && data.segments.length > 0) {
-          rawSegments = data.segments.map((s: any, idx: number) => ({
-            id: `seg_${idx + 1}`,
-            start: typeof s.start === 'number' ? Math.round(s.start * 100) / 100 : idx * 5,
-            end: typeof s.end === 'number' ? Math.round(s.end * 100) / 100 : (idx + 1) * 5,
-            text: (s.text || '').trim()
-          })).filter((s: any) => s.text.length > 0);
-          modelUsedName = data.engine || "Groq Cloud (Whisper-large-v3)";
-        } else {
-          throw new Error(data.error || "Groq Cloud 识别未能提取到有效语音文字");
+      const { segments, engineName } = await transcribeCloudInChunks(
+        pcm16k,
+        transmitBlob,
+        '/api/transcribe-groq',
+        options,
+        effectiveHotwords,
+        (pct, stageText) => {
+          onProgress({
+            status: 'loading_model',
+            progress: pct,
+            stage: stageText,
+            details: effectiveHotwords ? `已注入 ${activeDomainInfo?.name || '行业'} 200+ 专有名词热词库` : 'Groq LPU 极速转写'
+          });
         }
-      } else {
-        const errJson = await resp.json().catch(() => ({ error: 'Groq Cloud 响应异常' }));
-        throw new Error(errJson.message || errJson.error || "Groq Cloud 服务响应异常");
-      }
+      );
+      rawSegments = segments;
+      modelUsedName = engineName || "Groq Cloud (Whisper-large-v3)";
     } catch (groqErr: any) {
       console.warn("Groq Cloud transcribe error:", groqErr);
       throw new Error(`Groq Cloud 识别未成功: ${groqErr.message || '请确认 Groq Key 或网络连接'}。您可随时切换为【Gemini 3.6 Flash】云端引擎进行免费识别。`);
@@ -255,47 +442,23 @@ export async function transcribeAudioSource(
   } else if (selectedEngine === 'gemini') {
     // Mode B: Server Gemini 3.6 Flash Engine
     try {
-      onProgress({
-        status: 'loading_model',
-        progress: 45,
-        stage: '正在调用 Gemini 3.6 Flash 云端高精度引擎...',
-        details: '逐字听写与精准时间轴切分'
-      });
-
-      const base64Audio = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result as string);
-        reader.onerror = reject;
-        reader.readAsDataURL(audioBlob);
-      });
-
-      const resp = await fetch('/api/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          audioBase64: base64Audio,
-          mimeType: audioBlob.type || 'video/mp4',
-          language: options.language
-        })
-      });
-
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.success && Array.isArray(data.segments) && data.segments.length > 0) {
-          rawSegments = data.segments.map((s: any, idx: number) => ({
-            id: `seg_${idx + 1}`,
-            start: typeof s.start === 'number' ? Math.round(s.start * 100) / 100 : idx * 5,
-            end: typeof s.end === 'number' ? Math.round(s.end * 100) / 100 : (idx + 1) * 5,
-            text: (s.text || '').trim()
-          })).filter((s: any) => s.text.length > 0);
-          modelUsedName = data.engine || "Gemini 3.6 Flash 语音识别引擎";
-        } else {
-          throw new Error(data.error || "云端语音识别未匹配到文字内容");
+      const { segments, engineName } = await transcribeCloudInChunks(
+        pcm16k,
+        transmitBlob,
+        '/api/transcribe',
+        options,
+        effectiveHotwords,
+        (pct, stageText) => {
+          onProgress({
+            status: 'loading_model',
+            progress: pct,
+            stage: stageText,
+            details: 'Gemini 3.6 Flash 云端高精度听写与逐句对齐'
+          });
         }
-      } else {
-        const errJson = await resp.json().catch(() => ({ error: '云端识别响应异常' }));
-        throw new Error(errJson.error || "云端识别服务暂不可用");
-      }
+      );
+      rawSegments = segments;
+      modelUsedName = engineName || "Gemini 3.6 Flash 语音识别引擎";
     } catch (apiErr: any) {
       console.warn("Gemini cloud transcribe error:", apiErr);
       throw new Error(`Gemini 云端识别未成功: ${apiErr.message || '请检查音轨或切换为 Groq Cloud 引擎'}`);
@@ -378,7 +541,7 @@ export async function transcribeAudioSource(
     }
   }
 
-  // Post-processing
+  // Post-processing: Filter filler words
   let processedSegments = rawSegments.map(s => {
     let t = s.text;
     if (options.filterFillers) {
@@ -396,6 +559,41 @@ export async function transcribeAudioSource(
     }];
   }
 
+  const originalSegmentsBeforeCorrection = [...processedSegments];
+  let domainCorrectionApplied = false;
+
+  // Stage 2: LLM Domain Correction & Proofreading for specialized terminology
+  if (options.enableDomainCorrection && effectiveHotwords && processedSegments.length > 0) {
+    try {
+      onProgress({
+        status: 'transcribing',
+        progress: 92,
+        stage: `正在对齐【${activeDomainInfo?.name || '行业专有名词'}】精准同音校对...`,
+        details: '利用 Gemini 3.6 Flash 对 ASR 谐音进行热词库精准修正'
+      });
+
+      const correctResp = await fetch('/api/correct-domain-terms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          segments: processedSegments,
+          hotwords: effectiveHotwords,
+          domainName: activeDomainInfo?.name || '新能源与电池化学'
+        })
+      });
+
+      if (correctResp.ok) {
+        const cData = await correctResp.json();
+        if (cData.success && Array.isArray(cData.segments) && cData.segments.length === processedSegments.length) {
+          processedSegments = cData.segments;
+          domainCorrectionApplied = true;
+        }
+      }
+    } catch (err) {
+      console.warn("Domain correction failed gracefully:", err);
+    }
+  }
+
   // Construct full text
   const fullText = processedSegments.map(s => s.text).join(' ');
   const formattedFullText = options.autoPunctuation ? formatIntoParagraphs(processedSegments) : fullText;
@@ -407,7 +605,7 @@ export async function transcribeAudioSource(
     status: 'completed',
     progress: 100,
     stage: '提取完成！',
-    details: `耗时: ${((Date.now() - startTime) / 1000).toFixed(1)}s | 识别字数: ${wordCount} 字`
+    details: `耗时: ${((Date.now() - startTime) / 1000).toFixed(1)}s | 识别字数: ${wordCount} 字${domainCorrectionApplied ? ' | ✨ 已完成专业词汇 AI 校正' : ''}`
   });
 
   return {
@@ -424,6 +622,9 @@ export async function transcribeAudioSource(
     wordCount,
     modelUsed: modelUsedName,
     summaryPoints,
-    keywords
+    keywords,
+    domainCorrectionApplied,
+    activeDomainName: activeDomainInfo?.name,
+    originalSegments: domainCorrectionApplied ? originalSegmentsBeforeCorrection : undefined
   };
 }

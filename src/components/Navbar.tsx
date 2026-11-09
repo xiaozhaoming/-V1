@@ -29,7 +29,7 @@ export const Navbar: React.FC<NavbarProps> = ({ historyCount, onOpenHistory }) =
               <h1 className="text-lg font-bold tracking-tight text-slate-900 flex items-center gap-1.5">
                 离线视频语音转文案提取器
                 <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
-                  v1.0
+                  v1.3
                 </span>
               </h1>
             </div>

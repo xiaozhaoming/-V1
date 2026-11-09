@@ -6,6 +6,8 @@ export type ModelSize = 'tiny' | 'base' | 'small';
 
 export type LanguageCode = 'zh' | 'yue' | 'en' | 'ja' | 'auto';
 
+export type DomainPreset = 'battery' | 'tech' | 'finance' | 'medical' | 'general' | 'custom';
+
 export interface TranscriptionOptions {
   engine: EngineType;
   modelSize: ModelSize;
@@ -15,6 +17,10 @@ export interface TranscriptionOptions {
   filterFillers: boolean;
   includeTimestamps: boolean;
   segmentDuration: number; // in seconds
+  // Domain Hotwords & LLM Post-Correction
+  domainPreset: DomainPreset;
+  customHotwords?: string;
+  enableDomainCorrection: boolean;
 }
 
 export interface TranscriptionSegment {
@@ -41,6 +47,9 @@ export interface TranscriptionResult {
   modelUsed: string;
   summaryPoints?: string[];
   keywords?: string[];
+  domainCorrectionApplied?: boolean;
+  activeDomainName?: string;
+  originalSegments?: TranscriptionSegment[];
 }
 
 export type ProcessStatus = 

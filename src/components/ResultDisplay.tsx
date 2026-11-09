@@ -130,13 +130,19 @@ export const ResultDisplay: React.FC<ResultDisplayProps> = ({
       {/* Result Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-4">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
               📝 文案提取结果
             </h3>
             <span className="px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-xs font-bold border border-emerald-200">
               提取完成
             </span>
+            {result.domainCorrectionApplied && (
+              <span className="px-2.5 py-0.5 rounded-full bg-indigo-100 text-indigo-800 text-xs font-extrabold border border-indigo-200 flex items-center gap-1 shadow-2xs">
+                <Wand2 className="w-3.5 h-3.5 text-indigo-600" />
+                <span>✨ {result.activeDomainName || '行业专有名词'} AI 同音校正</span>
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-500 mt-1 flex items-center gap-3">
             <span>时长: <strong className="text-slate-700 font-mono">{formatTimestamp(result.duration)}</strong></span>
